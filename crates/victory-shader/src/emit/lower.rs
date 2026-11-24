@@ -24,8 +24,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
-/// Resource heap, scalar address term, and constant byte offset.
-type HeapView = (usize, Option<Value>, u32);
+/// Resource heap and fixed slot index.
+type HeapView = (usize, u32);
 
 fn heap_view(
     layout: &[RootParam],
@@ -36,13 +36,13 @@ fn heap_view(
         return None;
     };
     let address = scalar.get(load)?;
-    if layout.get(address.param)?.root != RootType::ResourceHeap {
+    // A runtime selector can address views of different types. A store
+    // on one control-flow path proves nothing about the other paths.
+    if layout.get(address.param)?.root != RootType::ResourceHeap || address.dynamic.is_some() {
         return None;
     }
     let offset = address.offset.wrapping_add(u32::from(*first) * 4);
-    // With a constant address the heap index ignores the low five bits.
-    let offset = if address.dynamic.is_none() { offset & !31 } else { offset };
-    Some((address.param, address.dynamic, offset))
+    Some((address.param, offset >> 5))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3328,7 +3328,7 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// A heap slot written through any exactly matched source is a UAV on
+    /// A fixed heap slot written through any exactly matched source is a UAV on
     /// reads too. An index phi gets one annotation after the join, so every
     /// incoming view must support that annotation.
     fn heap_uav(&self, src: &Source) -> Result<bool, Why> {
@@ -6995,6 +6995,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn shader_heap_conditional_store_does_not_classify_a_dynamic_index() {
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x8F07_8506, // s_lshl_b32 s7, s6, 5 (group id x)
+            0xF408_0202, 0x0E00_0000, // s_load_dwordx4 s[8:11], s[4:5], s7
+            0xF408_0302, 0xFA00_0040, // s_load_dwordx4 s[12:15], s[4:5], 64
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE030_1000, 0x8002_0100, // buffer_load_dword v1 through s[8:11]
+            0xE070_1000, 0x8003_0100, // buffer_store_dword v1 through s[12:15]
+            0xBF06_8106, // s_cmp_eq_u32 s6, 1
+            0xBF84_0002, // s_cbranch_scc0 -> s_endpgm
+            0xE070_1004, 0x8002_0100, // buffer_store_dword v1 through s[8:11]
+            S_ENDPGM,
+        ];
+        let mut annotations = lower_heap_compute(&words).unwrap().heap_annotations;
+        annotations.sort_unstable();
+        assert_eq!(annotations, [(0xB, 0), (0x100B, 0), (0x100B, 0)]);
     }
 
     #[test]
