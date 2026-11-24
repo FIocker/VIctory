@@ -198,54 +198,9 @@ impl Shadow {
             && from < to
         {
             let before = &before[from - taken..to - taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
-                }
-                at += n;
-            }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
-            }
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from), to - from) };
+            written = copy_back_bytes(start + from, host, before);
         }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
@@ -362,6 +317,86 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
+    }
+}
+
+/// Reads title memory by page and merges in the GPU's changes. Leave
+/// write-watch sampling to the next refresh, which samples before reading.
+fn copy_back_bytes(start: usize, host: &mut [u8], before: &[u8]) -> usize {
+    let mut title = vec![0u8; PAGE];
+    let mut written = 0;
+    let mut at = 0;
+    while at < host.len() {
+        let address = start + at;
+        let n = (PAGE - address % PAGE).min(host.len() - at);
+        let piece = &mut host[at..at + n];
+        let old = &before[at..at + n];
+        let title = &mut title[..n];
+        if piece != old && crate::host::read_into(address as *const u8, title) {
+            let mut changed = false;
+            for ((title, host), old) in title.iter_mut().zip(piece).zip(old) {
+                if *host != *old && *title != *host {
+                    *title = *host;
+                    changed = true;
+                }
+                *host = *title;
+            }
+            if changed {
+                crate::watch::writing(address, n);
+                crate::host::write_mapped(address as *mut u8, title.as_ptr(), n);
+                written += n;
+            }
+        }
+        at += n;
+    }
+    written
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_back_leaves_title_write_watch_for_the_next_refresh() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        struct Title(*mut u8);
+        impl Drop for Title {
+            fn drop(&mut self) {
+                // SAFETY: this is the base of the allocation owned by Title.
+                unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            }
+        }
+
+        // SAFETY: allocate a new test-only page with native write-watch.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let memory = Title(base.cast());
+        let start = memory.0 as usize;
+        let end = start + PAGE;
+        let (copied, _) = crate::watch::writes(start, end, false).unwrap();
+        // SAFETY: inside the test allocation.
+        unsafe { memory.0.add(64).write_volatile(7) };
+        let before = vec![0; PAGE];
+        let mut host = before.clone();
+        host[0] = 3;
+        assert_eq!(copy_back_bytes(start, &mut host, &before), PAGE);
+        let (next, writes) = crate::watch::writes(start, end, false).unwrap();
+        assert!(next > copied);
+        assert_eq!(writes, [(start / PAGE, next)]);
+        // SAFETY: inside the test allocation.
+        assert_eq!(unsafe { memory.0.read_volatile() }, 3);
+        assert_eq!(unsafe { memory.0.add(64).read_volatile() }, 7);
     }
 }
 
