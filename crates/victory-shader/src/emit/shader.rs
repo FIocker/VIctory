@@ -66,6 +66,8 @@ pub(crate) struct Shader {
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
     pub flags: u64,
+    #[cfg(test)]
+    pub heap_annotations: Vec<(u32, u32)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -119,6 +121,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             flags: 0,
+            #[cfg(test)]
+            heap_annotations: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -275,6 +279,10 @@ impl Shader {
 
     /// A descriptor heap handle, annotated with `props`.
     pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+        #[cfg(test)]
+        if !sampler {
+            self.heap_annotations.push(props);
+        }
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {

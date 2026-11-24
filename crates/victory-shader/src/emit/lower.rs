@@ -16,11 +16,34 @@ use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
-use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
+use crate::native::{
+    HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage, UsedResource,
+};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
+
+/// Resource heap, scalar address term, and constant byte offset.
+type HeapView = (usize, Option<Value>, u32);
+
+fn heap_view(
+    layout: &[RootParam],
+    scalar: &HashMap<Site, Address>,
+    src: &Source,
+) -> Option<HeapView> {
+    let Source::Loaded { load, first } = src else {
+        return None;
+    };
+    let address = scalar.get(load)?;
+    if layout.get(address.param)?.root != RootType::ResourceHeap {
+        return None;
+    }
+    let offset = address.offset.wrapping_add(u32::from(*first) * 4);
+    // With a constant address the heap index ignores the low five bits.
+    let offset = if address.dynamic.is_none() { offset & !31 } else { offset };
+    Some((address.param, address.dynamic, offset))
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -37,6 +60,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    #[cfg(test)]
+    pub heap_annotations: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -165,6 +190,8 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// Resource heap descriptors the program writes through.
+    heap_uavs: HashSet<HeapView>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -443,6 +470,19 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let scalar = x.res.scalar.iter().copied().collect();
+        let heap_uavs = x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| {
+                let inst = &p.blocks[d.site.0].insts[d.site.1];
+                d.role == Role::Resource
+                    && (inst.name().contains("_store") || inst.name().contains("_atomic"))
+            })
+            .flat_map(|d| d.source.leaves())
+            .filter_map(|src| heap_view(&x.native.layout, &scalar, src))
+            .collect();
         Lower {
             s,
             x,
@@ -469,7 +509,8 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
+            heap_uavs,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -897,6 +938,8 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            #[cfg(test)]
+            heap_annotations: std::mem::take(&mut self.s.heap_annotations),
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2840,8 +2883,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let heap_uav = self.heap_uav(src)?;
+        if heap_uav || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            let h = self.handle(site, src, false, (11 | if heap_uav { 0x1000 } else { 0 }, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -2955,7 +2999,8 @@ impl<'a> Lower<'a> {
         let un = ui.name();
         let uav = un.contains("store")
             || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
+            || used.is_some_and(|u| u.kind == ResourceType::Uav)
+            || self.heap_uav(&src)?;
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
@@ -3281,6 +3326,33 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// A heap slot written through any exactly matched source is a UAV on
+    /// reads too. An index phi gets one annotation after the join, so every
+    /// incoming view must support that annotation.
+    fn heap_uav(&self, src: &Source) -> Result<bool, Why> {
+        if self.heap_uavs.is_empty() {
+            return Ok(false);
+        }
+        let written = |src| {
+            heap_view(&self.x.native.layout, &self.scalar, src)
+                .is_some_and(|view| self.heap_uavs.contains(&view))
+        };
+        if !matches!(src, Source::Phi { .. }) {
+            return Ok(written(src));
+        }
+        let leaves = src.leaves();
+        if !leaves.iter().any(|src| written(src)) {
+            return Ok(false);
+        }
+        if leaves.iter().all(|src| {
+            written(src) || self.used_kind(src).is_some_and(|u| u.kind == ResourceType::Uav)
+        }) {
+            Ok(true)
+        } else {
+            Err("a descriptor join with mixed view types")
+        }
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -5481,6 +5553,7 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
         let uav = store
+            || self.heap_uav(src)?
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
@@ -6071,6 +6144,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        let heap_uav = self.heap_uav(src)?;
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -6079,7 +6153,7 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
-        if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+        if !heap_uav && used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -6103,7 +6177,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = store
+            || atomic.is_some()
+            || heap_uav
+            || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
@@ -6781,20 +6858,28 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, half_shift, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lower_compute(words, rsrc2, vec![]).map(|_| ())
+    }
+
+    fn lower_compute(
+        words: &[u32],
+        rsrc2: u32,
+        layout: Vec<RootParam>,
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 256,
-            layout: vec![],
+            layout,
             used: vec![],
             io: StageIo::Cs(ComputeIo {
                 rsrc2,
@@ -6806,7 +6891,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        lower(&Parts {
+        let lowered = lower(&Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -6816,8 +6901,117 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        })
-        .map(|_| ())
+        })?;
+        #[cfg(windows)]
+        if !native.layout.is_empty() {
+            use crate::emit::validator::Validator;
+            let path = Validator::default_path();
+            if let Ok(mut validator) = Validator::load(path.as_deref()) {
+                let container = crate::Container {
+                    digest: [0; 16],
+                    version: (1, 0),
+                    parts: Vec::new(),
+                };
+                let mut dxil = crate::emit::emit(&container, &native, &p, &st, &io, &res)?.dxil;
+                validator.validate(&mut dxil).unwrap();
+            } else {
+                eprintln!("dxil.dll unavailable; checked annotations only");
+            }
+        }
+        Ok(lowered)
+    }
+
+    fn lower_heap_compute(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        lower_compute(
+            words,
+            (6 << 1) | (1 << 7),
+            vec![RootParam {
+                root: RootType::ResourceHeap,
+                user_data: 4,
+                slot: 0,
+                sgprs: 1,
+                table_offset_dwords: 0,
+                base_register: 0,
+            }],
+        )
+    }
+
+    #[test]
+    fn shader_heap_buffers_keep_the_same_uav_type_on_loads_and_stores() {
+        let prefix = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+        ];
+        let vector_load = [0xE030_1000, 0x8002_0100];
+        let scalar_load = [
+            0xF420_0184, 0xFA00_0000, // s_buffer_load_dword s6, s[8:11], 0
+            0x7E02_0206, // v_mov_b32 v1, s6
+        ];
+        let same_slot = [0xE070_1004, 0x8002_0100, S_ENDPGM];
+        let reloaded = [
+            0xF408_0302, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0
+            0xE070_1004, 0x8003_0100, // buffer_store_dword v1 through s[12:15]
+            S_ENDPGM,
+        ];
+        let adjacent = [
+            0xF408_0302, 0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32
+            0xE030_1000, 0x8003_0100, // buffer_load_dword v1 through s[12:15]
+            0xE070_1004, 0x8002_0100, // buffer_store_dword v1 through s[8:11]
+            S_ENDPGM,
+        ];
+        for (body, expected) in [
+            ([vector_load.as_slice(), &same_slot].concat(), vec![(0x100B, 0)]),
+            ([vector_load.as_slice(), &reloaded].concat(), vec![(0x100B, 0); 2]),
+            ([scalar_load.as_slice(), &same_slot].concat(), vec![(0x100B, 0)]),
+            (adjacent.to_vec(), vec![(0xB, 0), (0x100B, 0)]),
+        ] {
+            let words = [prefix.as_slice(), &body].concat();
+            let mut annotations = lower_heap_compute(&words).unwrap().heap_annotations;
+            annotations.sort_unstable();
+            assert_eq!(annotations, expected);
+        }
+    }
+
+    #[test]
+    fn shader_heap_refuses_a_join_of_writable_and_read_only_slots() {
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBF06_8006, // s_cmp_eq_u32 s6, 0 (group id x)
+            0xBF85_0003, // branch to the second descriptor load
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xBF82_0002, // branch to the join
+            0xF408_0202, 0xFA00_0020, // s_load_dwordx4 s[8:11], s[4:5], 32
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0xE030_1000, 0x8002_0100, // buffer_load_dword v1 through the joined descriptor
+            0xF408_0302, 0xFA00_0000, // s_load_dwordx4 s[12:15], s[4:5], 0
+            0xE070_1004, 0x8003_0100, // buffer_store_dword v1 through slot 0
+            S_ENDPGM,
+        ];
+        assert!(matches!(
+            lower_heap_compute(&words),
+            Err(crate::ShaderError::Unsupported {
+                what: "a descriptor join with mixed view types",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn shader_heap_images_keep_the_same_uav_type_on_loads_and_stores() {
+        let words = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xF000_8F08, 0x0002_0200, // image_load v[2:5], v[0:1], s[8:11], 2D r128
+            0xF020_8F08, 0x0002_0200, // image_store v[2:5], v[0:1], s[8:11], 2D r128
+            S_ENDPGM,
+        ];
+        assert_eq!(
+            lower_heap_compute(&words).unwrap().heap_annotations,
+            [(0x1002, 0x409)]
+        );
     }
 
     #[test]
